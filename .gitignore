@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+dist/
+*.egg-info/
+.pytest_cache/
+src/turboquant_mlx/codebooks/*.json

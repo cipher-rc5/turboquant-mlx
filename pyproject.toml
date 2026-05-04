@@ -1,0 +1,45 @@
+[project]
+name = "turboquant-mlx"
+version = "0.2.0"
+description = "TurboQuant KV cache compression for Gemma 4 31B text-only inference on Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+dependencies = [
+    "mlx>=0.31.2",
+    "mlx-lm>=0.31.3",
+    "numpy>=2.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "pytest-benchmark>=5.0",
+]
+server = [
+    "fastapi>=0.136",
+    "uvicorn[standard]>=0.46",
+]
+
+[project.scripts]
+tq-chat     = "turboquant_mlx.cli.chat:main"
+tq-generate = "turboquant_mlx.cli.generate:main"
+tq-codebook = "turboquant_mlx.codebook:cli_main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/turboquant_mlx"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "pytest-benchmark>=5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
