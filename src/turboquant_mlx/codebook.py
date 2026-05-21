@@ -1,5 +1,5 @@
 # file: src/turboquant_mlx/codebook.py
-# description: Lloyd-Max optimal scalar quantizer for Beta(0.5, 0.5) distribution.
+# description: Lloyd-Max optimal scalar quantizers for TurboQuant key codebooks.
 #              Replicates 0xSero/turboquant codebook.py with all CUDA/Triton removed.
 #              Runs on CPU via numpy; codebooks are pre-baked into mlx arrays at load time.
 # reference: arXiv:2504.19874 Algorithm 1; 0xSero/turboquant/turboquant/codebook.py
@@ -14,8 +14,10 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+from .config import DEFAULT_CODEBOOK_DIMS
+
 # ---------------------------------------------------------------------------
-# Beta(0.5, 0.5) PDF helper (arcsine distribution)
+# PDF helpers
 # ---------------------------------------------------------------------------
 
 def _beta_half_pdf(x: np.ndarray) -> np.ndarray:
@@ -28,11 +30,16 @@ def _beta_half_pdf(x: np.ndarray) -> np.ndarray:
     return 1.0 / (math.pi * np.sqrt(x * (1.0 - x)))
 
 
+def _gaussian_pdf(x: np.ndarray) -> np.ndarray:
+    """PDF of the standard normal distribution N(0, 1)."""
+    return np.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+
 # ---------------------------------------------------------------------------
 # Lloyd-Max iteration
 # ---------------------------------------------------------------------------
 
-def lloyd_max(
+def lloyd_max_beta(
     n_bins: int,
     n_iter: int = 500,
     n_grid: int = 100_000,
@@ -83,6 +90,52 @@ def lloyd_max(
     return boundaries, centroids
 
 
+def lloyd_max_gaussian(
+    n_bins: int,
+    n_iter: int = 500,
+    n_grid: int = 200_000,
+    x_min: float = -4.0,
+    x_max: float = 4.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Run Lloyd-Max quantizer design for N(0, 1) on a clipped finite interval.
+
+    TurboQuant keys are unit-normalised, randomly rotated, then multiplied by
+    sqrt(head_dim).  Those coordinates are approximately standard normal, not
+    Beta-distributed on [0, 1].
+    """
+    x_grid = np.linspace(x_min, x_max, n_grid)
+    pdf = _gaussian_pdf(x_grid)
+    pdf /= pdf.sum()
+
+    boundaries = np.linspace(x_min, x_max, n_bins + 1)
+
+    for _ in range(n_iter):
+        centroids = np.empty(n_bins)
+        for k in range(n_bins):
+            lo, hi = boundaries[k], boundaries[k + 1]
+            mask = (x_grid >= lo) & (x_grid < hi)
+            w = pdf[mask]
+            if w.sum() < 1e-30:
+                centroids[k] = (lo + hi) / 2.0
+            else:
+                centroids[k] = (x_grid[mask] * w).sum() / w.sum()
+
+        new_boundaries = boundaries.copy()
+        for k in range(1, n_bins):
+            new_boundaries[k] = (centroids[k - 1] + centroids[k]) / 2.0
+
+        if np.max(np.abs(new_boundaries[1:-1] - boundaries[1:-1])) < 1e-9:
+            break
+        boundaries = new_boundaries
+
+    return boundaries, centroids
+
+
+# Backwards-compatible name for callers that imported the old Beta quantizer.
+lloyd_max = lloyd_max_beta
+
+
 # ---------------------------------------------------------------------------
 # Codebook cache (in-memory singleton)
 # ---------------------------------------------------------------------------
@@ -101,8 +154,8 @@ def get_codebook(head_dim: int, bits: int) -> tuple[mx.array, mx.array]:
 
     Parameters
     ----------
-    head_dim : int   - dimension of each key/value head (typically 64 or 128)
-    bits     : int   - quantization bits (2, 3, or 4)
+    head_dim : int   - dimension of each key/value head
+    bits     : int   - quantization bits
     """
     key = (head_dim, bits)
     if key in _CACHE:
@@ -113,12 +166,23 @@ def get_codebook(head_dim: int, bits: int) -> tuple[mx.array, mx.array]:
 
     if disk_path.exists():
         payload = json.loads(disk_path.read_text())
-        boundaries = np.array(payload["boundaries"], dtype=np.float32)
-        centroids = np.array(payload["centroids"], dtype=np.float32)
+        if payload.get("family") == "gaussian-v1":
+            boundaries = np.array(payload["boundaries"], dtype=np.float32)
+            centroids = np.array(payload["centroids"], dtype=np.float32)
+        else:
+            boundaries, centroids = lloyd_max_gaussian(n_bins)
+            disk_path.write_text(json.dumps({
+                "family": "gaussian-v1",
+                "head_dim": head_dim,
+                "bits": bits,
+                "boundaries": boundaries.tolist(),
+                "centroids": centroids.tolist(),
+            }, indent=2))
     else:
-        boundaries, centroids = lloyd_max(n_bins)
+        boundaries, centroids = lloyd_max_gaussian(n_bins)
         _CODEBOOK_DIR.mkdir(parents=True, exist_ok=True)
         disk_path.write_text(json.dumps({
+            "family": "gaussian-v1",
             "head_dim": head_dim,
             "bits": bits,
             "boundaries": boundaries.tolist(),
@@ -142,18 +206,17 @@ def quantize_with_codebook(x: mx.array, boundaries: mx.array) -> mx.array:
 
     Parameters
     ----------
-    x          : (..., D) float16 in [0, 1]
+    x          : (..., D) float16 within the codebook boundary range
     boundaries : (n_bins + 1,) float16
 
     Returns
     -------
     indices    : (..., D) uint8
     """
-    # bucketize: count how many boundaries each element exceeds
-    # boundaries shape (B+1,), x shape (..., D)
-    # expand for broadcasting: (..., D, 1) vs (B+1,)
-    x_exp = x[..., None]                    # (..., D, 1)
-    gt = (x_exp > boundaries[:-1]).sum(axis=-1) - 1  # (..., D)
+    x_exp = x[..., None]                             # (..., D, 1)
+    # Count upper boundaries that x meets or exceeds — directly gives bin index.
+    # Using > boundaries[:-1] - 1 was off-by-one for values exactly at a boundary.
+    gt = (x_exp >= boundaries[1:]).sum(axis=-1)      # (..., D)
     gt = mx.clip(gt, 0, boundaries.shape[0] - 2)
     return gt.astype(mx.uint8)
 
@@ -289,11 +352,8 @@ def pack_bits(indices: mx.array, bits: int) -> mx.array:
     # vector.
     out = mx.zeros((n, packed_d), dtype=mx.uint32)
 
-    row_idx = mx.arange(n, dtype=mx.int32)[:, None]        # (N, 1)
-    # scatter low bytes
-    out = _scatter_or_row(out, row_idx, plan["lo_byte"], lo_contrib, packed_d)
-    # scatter high bytes (only where hi_active==1; contrib already gated)
-    out = _scatter_or_row(out, row_idx, plan["hi_byte"], hi_contrib, packed_d)
+    out = _scatter_or_row(out, plan["lo_byte"], lo_contrib, packed_d)
+    out = _scatter_or_row(out, plan["hi_byte"], hi_contrib, packed_d)
 
     out_u8 = (out & 0xFF).astype(mx.uint8)
     new_shape = orig_shape[:-1] + (packed_d,)
@@ -302,7 +362,6 @@ def pack_bits(indices: mx.array, bits: int) -> mx.array:
 
 def _scatter_or_row(
     acc: mx.array,
-    row_idx: mx.array,
     col_idx: mx.array,
     contrib: mx.array,
     packed_d: int,
@@ -353,7 +412,7 @@ def unpack_bits(packed: mx.array, bits: int, original_dim: int) -> mx.array:
 
 def cli_main() -> None:
     parser = argparse.ArgumentParser(description="Pre-generate TurboQuant Lloyd-Max codebooks")
-    parser.add_argument("--dims",  nargs="+", type=int, default=[64, 128, 256])
+    parser.add_argument("--dims",  nargs="+", type=int, default=list(DEFAULT_CODEBOOK_DIMS))
     parser.add_argument("--bits",  nargs="+", type=int, default=[2, 3, 4])
     parser.add_argument("--iter",  type=int, default=500)
     args = parser.parse_args()

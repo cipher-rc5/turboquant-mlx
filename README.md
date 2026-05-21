@@ -40,8 +40,8 @@ uv sync
 ## Pre-generate codebooks
 
 ```sh
-# Gemma 4 31B: hidden_size=5120, num_attention_heads=32 -> head_dim=160
-uv run tq-codebook --dims 160 --bits 2 3 4
+# Gemma 4 31B exposes per-layer head_dim directly: 256 for 50 layers, 512 for 10 layers
+uv run tq-codebook --dims 256 512 --bits 2 3 4
 ```
 
 Codebooks are cached to `src/turboquant_mlx/codebooks/` and auto-generated on first
@@ -111,8 +111,8 @@ uv run pytest
 
 ```
 turboquant_mlx/
-  codebook.py      # Lloyd-Max codebook for Beta(0.5,0.5) + bit-packing
-  codebooks/       # cached JSON codebook files (d=160 for Gemma 4 31B)
+  codebook.py      # Lloyd-Max Gaussian key codebooks + bit-packing
+  codebooks/       # cached JSON codebook files (d=256,512 for Gemma 4 31B)
   rotation.py      # random orthogonal rotation + QJL projection
   quantizer.py     # TurboQuantMSE + TurboQuantProd pipelines
   kv_cache.py      # per-layer KV cache manager (ring buffer + flush)
@@ -127,7 +127,8 @@ pyproject.toml     # uv project manifest (mlx-lm >= 0.31)
 ## Gemma 4 31B architecture notes
 
 - 60 decoder layers, hybrid sliding-window (1024 tokens) + global attention
-- head_dim = 160 (hidden_size=5120 / num_attention_heads=32)
+- head_dim is read from each attention layer, not computed from hidden size
+- discovered text-layer geometry: 50 layers use head_dim=256, 10 layers use head_dim=512
 - 256K token context window
 - No audio encoder at 31B size (audio is E2B/E4B only per processor_config.json)
 - TurboQuant patches all 60 attention layers; global layers benefit most since they

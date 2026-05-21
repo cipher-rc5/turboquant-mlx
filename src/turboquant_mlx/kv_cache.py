@@ -22,6 +22,7 @@ from .quantizer import (
     TurboQuantMSE,
     TurboQuantProd,
 )
+from .codebook import get_codebook
 
 
 # ---------------------------------------------------------------------------
@@ -61,15 +62,37 @@ class TurboQuantLayerCache:
     # internal state (not passed to __init__)
     compressed_keys: list[CompressedKey] = field(default_factory=list)
     compressed_values: list[CompressedValue] = field(default_factory=list)
-    # buffer of recent uncompressed tokens, stored as a single (B, K*D) array.
-    # `None` until the first update; growing by `mx.concatenate` is O(B), but
-    # B is bounded by buffer_size + flush_batch so it never blows up.
-    key_buffer: mx.array | None = None
-    value_buffer: mx.array | None = None
+    # Per-token chunks of (T_chunk, K*D); stacked on demand.  Using a Python
+    # list of small chunks plus a single ``mx.concatenate`` at use-time avoids
+    # the O(B²) reallocation of growing a single array by concatenation on
+    # every decode step.
+    _key_chunks: list[mx.array] = field(default_factory=list)
+    _value_chunks: list[mx.array] = field(default_factory=list)
+    _buffer_len: int = 0
 
     @property
     def buffer_len(self) -> int:
-        return 0 if self.key_buffer is None else int(self.key_buffer.shape[0])
+        return self._buffer_len
+
+    @property
+    def key_buffer(self) -> mx.array | None:
+        if not self._key_chunks:
+            return None
+        if len(self._key_chunks) == 1:
+            return self._key_chunks[0]
+        merged = mx.concatenate(self._key_chunks, axis=0)
+        self._key_chunks = [merged]
+        return merged
+
+    @property
+    def value_buffer(self) -> mx.array | None:
+        if not self._value_chunks:
+            return None
+        if len(self._value_chunks) == 1:
+            return self._value_chunks[0]
+        merged = mx.concatenate(self._value_chunks, axis=0)
+        self._value_chunks = [merged]
+        return merged
 
     @property
     def n_tokens(self) -> int:
@@ -91,14 +114,12 @@ class TurboQuantLayerCache:
         keys   : (T_new, n_kv_heads * head_dim) float16
         values : (T_new, n_kv_heads * head_dim) float16
         """
-        if self.key_buffer is None:
-            self.key_buffer = keys
-            self.value_buffer = values
-        else:
-            self.key_buffer   = mx.concatenate([self.key_buffer,   keys],   axis=0)
-            self.value_buffer = mx.concatenate([self.value_buffer, values], axis=0)
+        T_new = int(keys.shape[0])
+        self._key_chunks.append(keys)
+        self._value_chunks.append(values)
+        self._buffer_len += T_new
 
-        overflow = self.buffer_len - self.buffer_size
+        overflow = self._buffer_len - self.buffer_size
         if overflow >= self.flush_batch:
             self._flush(overflow)
 
@@ -107,8 +128,12 @@ class TurboQuantLayerCache:
         K = self.n_kv_heads
         D = self.key_quantizer.head_dim
 
-        k_batch = self.key_buffer[:n]      # (n, K*D)
-        v_batch = self.value_buffer[:n]
+        k_buf = self.key_buffer    # forces stack into a single array
+        v_buf = self.value_buffer
+        assert k_buf is not None and v_buf is not None
+
+        k_batch = k_buf[:n]
+        v_batch = v_buf[:n]
 
         # Treat every (token, kv_head) slot as an independent vector for the
         # quantizer.  Layout is token-major, KV-head-minor within each token:
@@ -120,14 +145,26 @@ class TurboQuantLayerCache:
             self.value_quantizer.compress(v_batch.reshape(n * K, D))
         )
 
-        self.key_buffer   = self.key_buffer[n:]
-        self.value_buffer = self.value_buffer[n:]
+        self._key_chunks   = [k_buf[n:]]
+        self._value_chunks = [v_buf[n:]]
+        self._buffer_len  -= n
 
     # ------------------------------------------------------------------
 
     def attention(self, query: mx.array) -> mx.array:
         """
         Compute full-context attention for a single query token.
+
+        Strategy on Apple Silicon (no custom Metal kernel for score-on-packed-
+        bits): decompress all compressed K and V into float16 once per step,
+        concatenate with the uncompressed buffer, and call the fused
+        ``mx.fast.scaled_dot_product_attention`` kernel.  We give up the QJL
+        residual correction for compressed tokens (Lloyd-Max scalar
+        quantisation alone provides the dominant fidelity), but in exchange
+        recover the same fused-attention path that baseline mlx-lm uses.
+
+        The compressed K/V cache stays small for memory-headroom benefit; the
+        decompressed reconstruction is a transient per-step allocation.
 
         Parameters
         ----------
@@ -139,104 +176,59 @@ class TurboQuantLayerCache:
         """
         H, D = query.shape
         K = self.n_kv_heads
-        G = H // K       # query groups per KV head  (G=1 for MHA, G>1 for GQA)
         scale = self.scale if self.scale is not None else D ** -0.5
 
-        # ---- fast path: no compressed batches yet -------------------------
-        # Until the buffer first overflows, the cache holds the full history
-        # exactly.  Use the fused attention kernel — same path as baseline
-        # mlx-lm — instead of hand-rolled matmul + softmax + einsum.
-        if not self.compressed_keys and self.buffer_len:
-            B = self.buffer_len
-            # (1, K, B, D)
-            k = self.key_buffer.reshape(B, K, D).transpose(1, 0, 2)[None]
-            v = self.value_buffer.reshape(B, K, D).transpose(1, 0, 2)[None]
-            # (1, H, 1, D)
-            q = query.reshape(1, H, 1, D)
-            out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
-            return out.reshape(H, D).astype(mx.float16)
+        keys_full, values_full = self._materialise_kv()  # (T_total, K, D) each
 
-        all_scores: list[mx.array] = []
+        # (1, K, T_total, D)
+        k = keys_full.transpose(1, 0, 2)[None]
+        v = values_full.transpose(1, 0, 2)[None]
+        q = query.reshape(1, H, 1, D)
 
-        # ---- compressed key scores ----------------------------------------
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+        return out.reshape(H, D).astype(mx.float16)
+
+    def _materialise_kv(self) -> tuple[mx.array, mx.array]:
+        """Reconstruct full (T_total, K, D) K and V tensors for this step.
+
+        Compressed batches are decoded back to approximate float16 keys via
+        the codebook + rotation inverse, and approximate float16 values via
+        per-group dequantisation; both are then concatenated with the
+        uncompressed buffer.  Allocated fresh each call — no persistent
+        decoded cache — so peak resident memory stays close to compressed
+        size between calls.
+        """
+        K = self.n_kv_heads
+        D = self.key_quantizer.head_dim
+
+        keys_chunks: list[mx.array] = []
+        values_chunks: list[mx.array] = []
+
         for ck in self.compressed_keys:
-            n_virt = int(ck.packed.shape[0])   # n_real * K
-            n_real = n_virt // K
-
-            # raw: (H, n_virt)  — scores vs every (token, kv_head) virtual slot
-            raw = self.key_quantizer.attention_scores(query, ck)
-
-            if K == 1:
-                all_scores.append(raw)                           # (H, n_real)
-            else:
-                # Layout of raw columns: token-major, kv-head-minor
-                # raw[h, t*K + k] = approx score of query head h vs token t, kv head k
-                # Reshape → (K, G, n_real, K); diagonal over the two K dims gives
-                # (K, G, n_real) = (H, n_real): each query group attends its own KV head
-                raw4 = raw.reshape(K, G, n_real, K)
-                diag  = mx.eye(K, dtype=raw.dtype)               # (K, K)
-                scores_gqa = (raw4 * diag[:, None, None, :]).sum(-1)  # (K, G, n_real)
-                all_scores.append(scores_gqa.reshape(H, n_real))
-
-        # ---- uncompressed buffer scores -----------------------------------
-        if self.buffer_len:
-            B   = self.buffer_len
-            k_buf = self.key_buffer                              # (B, K*D)
-
-            if K == 1:
-                all_scores.append(query @ k_buf.T)               # (H, B)
-            else:
-                # (K, B, D) — KV heads as leading dim for batched matmul
-                k_buf3 = k_buf.reshape(B, K, D).transpose(1, 0, 2)
-                q3     = query.reshape(K, G, D)                  # (K, G, D)
-                # (K, G, D) @ (K, D, B) → (K, G, B) → (H, B)
-                all_scores.append(
-                    (q3 @ k_buf3.transpose(0, 2, 1)).reshape(H, B)
-                )
-
-        # ---- softmax over all tokens --------------------------------------
-        all_scores_cat = mx.concatenate(all_scores, axis=-1) * scale  # (H, T_total)
-        weights = mx.softmax(all_scores_cat, axis=-1)                  # (H, T_total)
-
-        # ---- weighted sum of values ---------------------------------------
-        output = mx.zeros(query.shape, dtype=mx.float16)
-        offset = 0
-
-        for i, cv in enumerate(self.compressed_values):
-            n_virt = int(self.compressed_keys[i].packed.shape[0])
-            n_real = n_virt // K
-            v_hat  = self.value_quantizer.decompress(cv)          # (n_virt, D)
-
-            if K == 1:
-                w = weights[:, offset : offset + n_real]          # (H, n_real)
-                output = output + w @ v_hat
-            else:
-                v3 = v_hat.reshape(n_real, K, D)                  # (n_real, K, D)
-                w  = weights[:, offset : offset + n_real].reshape(K, G, n_real)
-                output = output + mx.einsum("kgn,nkd->kgd", w, v3).reshape(H, D)
-
-            offset += n_real
+            keys_chunks.append(self.key_quantizer.decompress(ck).reshape(-1, K, D))
+        for cv in self.compressed_values:
+            values_chunks.append(self.value_quantizer.decompress(cv).reshape(-1, K, D))
 
         if self.buffer_len:
-            B     = self.buffer_len
-            v_buf = self.value_buffer                              # (B, K*D)
-            w_buf = weights[:, offset:]                            # (H, B)
+            keys_chunks.append(self.key_buffer.reshape(-1, K, D))
+            values_chunks.append(self.value_buffer.reshape(-1, K, D))
 
-            if K == 1:
-                output = output + w_buf @ v_buf
-            else:
-                v_buf3 = v_buf.reshape(B, K, D)                   # (B, K, D)
-                w_buf3 = w_buf.reshape(K, G, B)                   # (K, G, B)
-                output = output + mx.einsum("kgb,bkd->kgd", w_buf3, v_buf3).reshape(H, D)
-
-        return output
+        if not keys_chunks:
+            raise RuntimeError("attention() called on empty TurboQuantLayerCache")
+        if len(keys_chunks) == 1:
+            return keys_chunks[0], values_chunks[0]
+        return (
+            mx.concatenate(keys_chunks, axis=0),
+            mx.concatenate(values_chunks, axis=0),
+        )
 
     def reset(self) -> None:
         """Clear all cached state."""
         self.compressed_keys.clear()
         self.compressed_values.clear()
-        self.key_buffer = None
-        self.value_buffer = None
+        self._key_chunks.clear()
+        self._value_chunks.clear()
+        self._buffer_len = 0
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +239,11 @@ def make_turboquant_cache(
     model,
     key_bits: int = 3,
     value_bits: int = 2,
+    use_qjl: bool = False,
     buffer_size: int = 128,
     flush_batch: int = 128,
     group_size: int = 32,
+    scale: float | None = None,
 ) -> list[TurboQuantLayerCache]:
     """
     Build a TurboQuant layer cache for every patchable attention layer.
@@ -257,21 +251,27 @@ def make_turboquant_cache(
     Parameters
     ----------
     model       : an mlx_lm model (must have .layers attribute)
-    key_bits    : bits for key quantisation (2-4)
-    value_bits  : bits for value quantisation (2 or 4)
+    key_bits    : bits for key quantisation
+    value_bits  : bits for value quantisation
+    use_qjl     : enable experimental QJL residual correction for keys
     buffer_size : uncompressed token buffer per layer
     flush_batch : tokens per compression batch
     group_size  : value group size for per-group quantisation
+    scale       : softmax scale override; pass 1.0 for Gemma 4 whose Q/K are
+                  RMSNormed (wrong scale silently flattens softmax → gibberish)
     """
-    fallback_head_dim = _infer_head_dim(model)
+    layers = _attention_layers(model)
+    codebook_dims = sorted({_read_head_dim_strict(_attn_module(layer)) for layer in layers})
+    for d in codebook_dims:
+        get_codebook(d, key_bits)
 
     caches = []
-    for layer in _attention_layers(model):
-        head_dim     = _layer_head_dim(layer, fallback_head_dim)
-        n_kv_heads   = _layer_n_kv_heads(layer)
+    for layer in layers:
+        head_dim      = _read_head_dim_strict(_attn_module(layer))
+        n_kv_heads    = _layer_n_kv_heads(layer)
         n_query_heads = _layer_n_query_heads(layer)
 
-        kq = TurboQuantMSE(head_dim=head_dim, bits=key_bits)
+        kq = TurboQuantMSE(head_dim=head_dim, bits=key_bits, use_qjl=use_qjl)
         vq = TurboQuantProd(head_dim=head_dim, bits=value_bits, group_size=group_size)
         caches.append(
             TurboQuantLayerCache(
@@ -281,6 +281,7 @@ def make_turboquant_cache(
                 flush_batch=flush_batch,
                 n_kv_heads=n_kv_heads,
                 n_query_heads=n_query_heads,
+                scale=scale,
             )
         )
     return caches
@@ -291,13 +292,7 @@ def make_turboquant_cache(
 # ---------------------------------------------------------------------------
 
 def _attention_layers(model) -> list:
-    """
-    Return model layers that have their own KV projections (i.e. are patchable).
-
-    Gemma 4 uses hybrid attention: sliding-window (head_dim=256) and global
-    (head_dim=512) layers alternate.  Layers whose attention module carries no
-    k_proj (KV-shared layers) are excluded because they have nothing to compress.
-    """
+    """Return model layers that have their own KV projections (i.e. are patchable)."""
     layers = []
     for layer in getattr(model, "layers", []):
         attn = _attn_module(layer)
@@ -317,14 +312,15 @@ def _attn_module(layer):
     )
 
 
-def _layer_head_dim(layer, fallback: int) -> int:
-    """Read head_dim directly from the layer's attention sub-module."""
-    attn = _attn_module(layer)
-    if attn is not None:
-        hd = getattr(attn, "head_dim", None)
-        if hd:
-            return int(hd)
-    return fallback
+def _read_head_dim_strict(attn) -> int:
+    hd = getattr(attn, "head_dim", None)
+    if hd is None:
+        raise RuntimeError(
+            f"Attention layer {type(attn).__name__} has no .head_dim attribute. "
+            f"Inspect the layer manually with dir(attn) and update _read_head_dim_strict. "
+            f"Do NOT fall back to hidden_size / n_heads -- Gemma decouples these."
+        )
+    return int(hd)
 
 
 def _layer_n_kv_heads(layer, fallback: int = 1) -> int:
@@ -350,33 +346,3 @@ def _layer_n_query_heads(layer, fallback: int = 1) -> int:
         if n:
             return int(n)
     return fallback
-
-
-def _infer_head_dim(model) -> int:
-    """
-    Fallback head_dim from the model-level config.
-
-    Gemma 4 31B text: head_dim=256 (sliding) / global_head_dim=512.
-    We return the sliding-window value as the safe default; per-layer
-    _layer_head_dim will override it for global-attention layers.
-    """
-    cfg = getattr(model, "config", None) or getattr(model, "args", None)
-    # unwrap nested text_config (gemma4 multimodal wrapper)
-    text_cfg = getattr(cfg, "text_config", None) or cfg
-    if text_cfg is not None:
-        hd = getattr(text_cfg, "head_dim", None)
-        if hd:
-            return int(hd)
-        n_heads = (
-            getattr(text_cfg, "num_attention_heads", None)
-            or getattr(text_cfg, "n_heads", None)
-        )
-        hidden = (
-            getattr(text_cfg, "hidden_size", None)
-            or getattr(text_cfg, "model_dim", None)
-            or getattr(text_cfg, "d_model", None)
-        )
-        if n_heads and hidden:
-            return int(hidden) // int(n_heads)
-    # Gemma 4 31B sliding-window default
-    return 256

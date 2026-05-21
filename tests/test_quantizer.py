@@ -54,28 +54,26 @@ class TestTurboQuantMSE:
         assert scores.shape[-1] == T, "scores should cover all T tokens"
 
     def test_inner_product_estimator_unbiased(self):
-        """
-        E[estimated score] ~= true score.  Tests paper claim Section 3.2.
-        Tolerance is generous for float16 + small T.
-        """
-        n_trials = 20
-        keys = _random_keys(T=1)
-        ck = self.tq.compress(keys)
-        query = _random_keys(T=1)
+        """E[QJL estimate] should converge to true score over many trials."""
+        n_trials = 200
+        keys_np = np.random.default_rng(42).standard_normal((1, HEAD_DIM)).astype(np.float32)
+        keys_np /= np.linalg.norm(keys_np, axis=-1, keepdims=True)
+        keys = mx.array(keys_np.astype(np.float16))
+        query_np = np.random.default_rng(7).standard_normal((1, HEAD_DIM)).astype(np.float32)
+        query = mx.array(query_np.astype(np.float16))
+        true_score = float(np.sum(query_np * keys_np))
 
-        true_score = float(mx.sum(query * keys).item())
         estimates = []
-        for _ in range(n_trials):
-            tq_trial = TurboQuantMSE(head_dim=HEAD_DIM, bits=3, use_qjl=True,
-                                     rotation_seed=_ * 7, qjl_seed=_ * 13)
-            ck_t = tq_trial.compress(keys)
-            s = float(tq_trial.attention_scores(query, ck_t).item())
-            estimates.append(s)
+        for i in range(n_trials):
+            tq = TurboQuantMSE(head_dim=HEAD_DIM, bits=3, use_qjl=True,
+                               rotation_seed=1000 + i, qjl_seed=2000 + i)
+            ck = tq.compress(keys)
+            estimates.append(float(tq.attention_scores(query, ck).item()))
 
-        mean_est = np.mean(estimates)
-        # within 15% relative error for float16
-        assert abs(mean_est - true_score) < 0.15 * max(abs(true_score), 1e-3), (
-            f"estimator bias too large: true={true_score:.4f} est_mean={mean_est:.4f}"
+        mean_est = float(np.mean(estimates))
+        sem = float(np.std(estimates) / math.sqrt(n_trials))
+        assert abs(mean_est - true_score) < 3 * sem + 0.05, (
+            f"true={true_score:.4f} mean_est={mean_est:.4f} sem={sem:.4f}"
         )
 
     def test_compression_ratio(self):

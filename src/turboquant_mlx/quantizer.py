@@ -84,7 +84,7 @@ class TurboQuantMSE:
     """
     Compress keys with:
       1. L2 normalisation + norm storage
-      2. Random orthogonal rotation -> Beta(0.5,0.5) marginals
+      2. Random orthogonal rotation + sqrt(D) scaling -> N(0,1) marginals
       3. Lloyd-Max scalar quantisation per coordinate
       4. Optional QJL residual sketch for unbiased inner-product estimation
 
@@ -95,7 +95,7 @@ class TurboQuantMSE:
         self,
         head_dim: int,
         bits: int = 3,
-        use_qjl: bool = True,
+        use_qjl: bool = False,
         rotation_seed: int = 42,
         qjl_seed: int = 99,
     ) -> None:
@@ -126,26 +126,19 @@ class TurboQuantMSE:
         safe_norms = mx.where(norms > 1e-8, norms, mx.ones_like(norms))
         k_normed = keys / safe_norms                                   # (T, D)
 
-        # 2. rotate -> Beta(0.5,0.5) marginals on unit sphere
+        # 2. rotate unit vectors, then scale coordinates into the N(0,1) codebook domain
         k_rot = rotate(k_normed, self.Q)                               # (T, D)
-
-        # 3. map from [-1, 1] to [0, 1] for codebook lookup
-        k_unit = (k_rot + 1.0) / 2.0
+        sqrt_d = math.sqrt(self.head_dim)
+        k_scaled = mx.clip(k_rot * sqrt_d, -4.0, 4.0)
 
         # 4. scalar quantise
-        indices = quantize_with_codebook(k_unit, self.boundaries)      # (T, D) uint8
+        indices = quantize_with_codebook(k_scaled, self.boundaries)    # (T, D) uint8
         packed = pack_bits(indices, self.bits)                         # (T, packed_D)
 
         # 5. QJL residual
         if self.use_qjl:
-            k_hat_unit = dequantize_with_codebook(indices, self.centroids)  # (T, D)
-            k_hat_rot_raw = k_hat_unit * 2.0 - 1.0
-            # Lloyd-Max centroids for Beta(0.5,0.5) amplify component magnitudes, so
-            # k_hat_rot_raw has ||·|| > 1 while k_rot is a unit vector.  Renormalise to
-            # unit sphere so the raw codebook score is cosine-only, not cosine × scale.
-            k_hat_norm = mx.linalg.norm(k_hat_rot_raw, axis=-1, keepdims=True)
-            safe_k = mx.where(k_hat_norm > 1e-8, k_hat_norm, mx.ones_like(k_hat_norm))
-            k_hat_rot = k_hat_rot_raw / safe_k
+            k_hat_scaled = dequantize_with_codebook(indices, self.centroids)  # (T, D)
+            k_hat_rot = k_hat_scaled / sqrt_d
             residual = k_rot - k_hat_rot                                    # (T, D)
             qjl_signs = qjl_encode(residual, self.S)                       # (T, n_sketch)  # ty:ignore[invalid-argument-type]
             residual_norms = mx.linalg.norm(residual, axis=-1)             # (T,)
@@ -161,6 +154,34 @@ class TurboQuantMSE:
             bits=self.bits,
             head_dim=self.head_dim,
         )
+
+    # ------------------------------------------------------------------
+    def decompress(self, ck: CompressedKey) -> mx.array:
+        """
+        Reconstruct approximate float16 keys from a CompressedKey.
+
+        This is the inverse of ``compress`` up to codebook quantisation
+        error: unpack indices → centroid lookup → un-rotate (Q is orthogonal
+        so Q^{-1} = Q^T, and ``rotate(x, Q) = x @ Q.T`` so the inverse is
+        ``x_rot @ Q``) → restore original L2 norm.
+
+        Returns
+        -------
+        keys : (T, head_dim) float16 — approximate reconstruction of the
+            original keys passed to ``compress``.
+        """
+        from .codebook import dequantize_with_codebook, unpack_bits
+
+        T = ck.norms.shape[0]
+        sqrt_d = math.sqrt(self.head_dim)
+        indices = unpack_bits(ck.packed, ck.bits, ck.head_dim)         # (T, D)
+        k_hat_scaled = dequantize_with_codebook(indices, self.centroids)  # (T, D)
+        k_hat_rot = k_hat_scaled / sqrt_d
+        # Q is orthogonal → inverse is Q (since rotate(x, Q) = x @ Q.T,
+        # the inverse rotation is x_rot @ Q)
+        k_unit = k_hat_rot @ self.Q
+        # restore norms
+        return (k_unit * ck.norms[:, None]).astype(mx.float16)
 
     # ------------------------------------------------------------------
     def attention_scores(
@@ -183,30 +204,25 @@ class TurboQuantMSE:
         # rotate query into key space
         q_rot = rotate_query(query, self.Q)                   # (..., D)
 
-        # unpack indices -> centroids -> scaled back to [-1, 1]
+        # unpack indices -> centroids -> scaled back to rotated unit-vector coordinates
+        sqrt_d = math.sqrt(self.head_dim)
         indices = unpack_bits(ck.packed, self.bits, self.head_dim)
-        k_hat_unit = dequantize_with_codebook(indices, self.centroids)  # (T, D)
-        k_hat_rot_raw = k_hat_unit * 2.0 - 1.0
-        # renormalise to unit sphere (consistent with compress)
-        k_hat_norm = mx.linalg.norm(k_hat_rot_raw, axis=-1, keepdims=True)
-        safe_k = mx.where(k_hat_norm > 1e-8, k_hat_norm, mx.ones_like(k_hat_norm))
-        k_hat_rot = k_hat_rot_raw / safe_k
+        k_hat_scaled = dequantize_with_codebook(indices, self.centroids)  # (T, D)
+        k_hat_rot = k_hat_scaled / sqrt_d
 
         # approximate scores: (q_rot @ k_hat_rot^T) * norms
         scores = q_rot @ k_hat_rot.T                          # (..., T)
         scores = scores * ck.norms[None, :]                   # broadcast norms
 
         # add QJL correction if present
-        # E[(q_rot @ S_j) * sign(residual @ S_j)] = sqrt(2/π) * <q_rot, residual> / ‖residual‖
-        # so correction ≈ n_sketch * sqrt(2/π) * <q_rot, residual/‖residual‖>
-        # → <q_rot, residual> ≈ correction * ‖residual‖ * sqrt(π/2) / n_sketch
         if self.use_qjl and ck.qjl_signs is not None and ck.residual_norms is not None:
             n_sketch = self.S.shape[1]  # ty:ignore[unresolved-attribute]
             correction = qjl_decode_correction(q_rot, ck.qjl_signs, self.S)  # ty:ignore[invalid-argument-type]
-            # E[(q·s)*sign(r·s)] = <q,r>/‖r‖ * sqrt(2/(π·D)) for unit s on S^{D-1}
-            # => <q,r> = correction * ‖r‖ * sqrt(π·D/2) / n_sketch
-            #          = correction * ‖r‖ * sqrt(π/2) / sqrt(n_sketch)  (D == n_sketch)
-            scale = ck.residual_norms * (math.sqrt(math.pi / 2) / math.sqrt(n_sketch))
+            # QJL estimator: corr = sum_j sign(r . s_j) * (q . s_j) with unit-norm s_j on S^{d-1}.
+            # E[sign(r.s)(q.s)] = sqrt(2/pi) * <q, r/||r||> per column.
+            # Summing m columns: corr ~ m * sqrt(2/pi) * <q, r> / ||r||
+            # Therefore <q, r> = corr * ||r|| * sqrt(pi/2) / m
+            scale = ck.residual_norms * (math.sqrt(math.pi / 2) / n_sketch)
             scores = scores + correction * scale
 
         return scores

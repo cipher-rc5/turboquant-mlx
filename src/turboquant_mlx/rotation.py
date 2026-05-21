@@ -36,8 +36,8 @@ def rotate(x: mx.array, Q: mx.array) -> mx.array:
     """
     Apply orthogonal rotation: x_rot = x @ Q^T.
 
-    Rotated coordinates follow Beta(0.5, 0.5) when x is unit-normed,
-    which is what the Lloyd-Max codebook is designed for.
+    Rotated unit-vector coordinates concentrate at scale 1/sqrt(D).  The
+    quantizer multiplies them by sqrt(D) before codebook lookup.
 
     Parameters
     ----------
