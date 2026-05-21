@@ -160,10 +160,33 @@ class TurboQuantMSE:
         """
         Reconstruct approximate float16 keys from a CompressedKey.
 
-        This is the inverse of ``compress`` up to codebook quantisation
-        error: unpack indices → centroid lookup → un-rotate (Q is orthogonal
-        so Q^{-1} = Q^T, and ``rotate(x, Q) = x @ Q.T`` so the inverse is
-        ``x_rot @ Q``) → restore original L2 norm.
+        Dispatches to the fused Metal kernel when one is available for
+        ``(ck.bits, self.head_dim)``; otherwise falls back to the pure-MLX
+        implementation. Both paths are numerically equivalent within fp16
+        rounding.
+        """
+        from .metal_kernels import decompress_packed_keys, has_metal_kernel
+
+        if has_metal_kernel(ck.bits, self.head_dim):
+            return decompress_packed_keys(
+                packed=ck.packed,
+                centroids=self.centroids,
+                Q=self.Q,
+                norms=ck.norms,
+                bits=ck.bits,
+                head_dim=self.head_dim,
+            )
+        return self._decompress_mlx(ck)
+
+    # ------------------------------------------------------------------
+    def _decompress_mlx(self, ck: CompressedKey) -> mx.array:
+        """
+        Pure-MLX reference decompress: unpack indices → centroid lookup →
+        un-rotate (Q is orthogonal so Q^{-1} = Q^T, and ``rotate(x, Q) =
+        x @ Q.T`` so the inverse is ``x_rot @ Q``) → restore original L2 norm.
+
+        Used as the fallback path on non-Metal platforms and as the
+        reference oracle by `tests/test_metal_kernel.py`.
 
         Returns
         -------
@@ -172,15 +195,11 @@ class TurboQuantMSE:
         """
         from .codebook import dequantize_with_codebook, unpack_bits
 
-        T = ck.norms.shape[0]
         sqrt_d = math.sqrt(self.head_dim)
         indices = unpack_bits(ck.packed, ck.bits, ck.head_dim)         # (T, D)
         k_hat_scaled = dequantize_with_codebook(indices, self.centroids)  # (T, D)
         k_hat_rot = k_hat_scaled / sqrt_d
-        # Q is orthogonal → inverse is Q (since rotate(x, Q) = x @ Q.T,
-        # the inverse rotation is x_rot @ Q)
         k_unit = k_hat_rot @ self.Q
-        # restore norms
         return (k_unit * ck.norms[:, None]).astype(mx.float16)
 
     # ------------------------------------------------------------------
