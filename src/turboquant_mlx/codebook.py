@@ -319,7 +319,7 @@ def _unpack_plan(bits: int, d: int) -> dict[str, mx.array]:
         "hi_byte": mx.array(hi_byte),
         "hi_shift": mx.array(hi_shift.astype(np.uint32)),
         "hi_active": mx.array(hi_active),
-        "out_mask": mx.array(np.uint32((1 << bits) - 1)),
+        "out_mask": mx.array((1 << bits) - 1, dtype=mx.uint32),
     }
     _UNPACK_PLAN[key] = plan
     return plan
@@ -378,7 +378,7 @@ def _scatter_or_row(
     at most two collisions, so float32 represents every intermediate exactly.
     """
     cols = mx.arange(packed_d, dtype=col_idx.dtype)[None, :]    # (1, packed_d)
-    onehot = (col_idx[:, None] == cols).astype(mx.float32)       # (D, packed_d)
+    onehot = mx.equal(col_idx[:, None], cols).astype(mx.float32)  # (D, packed_d)
     scattered = (contrib.astype(mx.float32) @ onehot).astype(mx.uint32)
     return acc + scattered
 

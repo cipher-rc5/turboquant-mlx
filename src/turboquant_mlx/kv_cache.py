@@ -210,8 +210,11 @@ class TurboQuantLayerCache:
             values_chunks.append(self.value_quantizer.decompress(cv).reshape(-1, K, D))
 
         if self.buffer_len:
-            keys_chunks.append(self.key_buffer.reshape(-1, K, D))
-            values_chunks.append(self.value_buffer.reshape(-1, K, D))
+            k_buf = self.key_buffer
+            v_buf = self.value_buffer
+            assert k_buf is not None and v_buf is not None
+            keys_chunks.append(k_buf.reshape(-1, K, D))
+            values_chunks.append(v_buf.reshape(-1, K, D))
 
         if not keys_chunks:
             raise RuntimeError("attention() called on empty TurboQuantLayerCache")

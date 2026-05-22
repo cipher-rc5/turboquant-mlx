@@ -22,7 +22,16 @@ valid as a threadgroup array dimension on a given MSL toolchain.
 
 from __future__ import annotations
 
+from typing import Callable, cast
+
 import mlx.core as mx
+
+
+# `mx.fast.metal_kernel` is typed as returning `object` in the MLX stubs, but
+# the value is callable and returns a list of arrays. Alias the call shape here
+# so callers stay type-checked at the use site; the `cast` below is the single
+# place we trust runtime behavior over the (under-specified) stub.
+MetalKernel = Callable[..., list[mx.array]]
 
 
 SUPPORTED_SPECIALIZATIONS: frozenset[tuple[int, int]] = frozenset(
@@ -141,20 +150,23 @@ def _kernel_source(bits: int, head_dim: int) -> str:
 """
 
 
-_KERNEL_CACHE: dict[tuple[int, int], object] = {}
+_KERNEL_CACHE: dict[tuple[int, int], MetalKernel] = {}
 
 
-def _get_kernel(bits: int, head_dim: int) -> object:
+def _get_kernel(bits: int, head_dim: int) -> MetalKernel:
     key = (bits, head_dim)
     cached = _KERNEL_CACHE.get(key)
     if cached is not None:
         return cached
-    kernel = mx.fast.metal_kernel(
-        name=f"turboquant_decompress_keys_b{bits}_d{head_dim}",
-        input_names=["packed", "centroids", "Q", "norms"],
-        output_names=["out"],
-        source=_kernel_source(bits, head_dim),
-        ensure_row_contiguous=True,
+    kernel = cast(
+        MetalKernel,
+        mx.fast.metal_kernel(
+            name=f"turboquant_decompress_keys_b{bits}_d{head_dim}",
+            input_names=["packed", "centroids", "Q", "norms"],
+            output_names=["out"],
+            source=_kernel_source(bits, head_dim),
+            ensure_row_contiguous=True,
+        ),
     )
     _KERNEL_CACHE[key] = kernel
     return kernel
